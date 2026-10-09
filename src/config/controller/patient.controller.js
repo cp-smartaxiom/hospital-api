@@ -1,4 +1,4 @@
-const pool = require("../database");
+const pool = require("../tenant-pool"); // the logged-in hospital's own database
 
 /*
  * Patients API. JSON uses the UI's field names:

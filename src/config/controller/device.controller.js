@@ -1,4 +1,5 @@
-const pool = require("../database");
+const pool = require("../tenant-pool"); // the logged-in hospital's own database
+const { registerDevice, unregisterDevice } = require("../device-registry");
 
 /*
  * Devices API for all device types.
@@ -246,6 +247,17 @@ const createDevice = async (req, res) => {
   const { errors, value } = validateDeviceInput(body, body.device_type, { isCreate: true });
   if (errors.length) return fail(res, 400, errors.join("; "));
 
+  // Device ids are unique across hospitals (MQTT routing), so claim it centrally first.
+  let registered = false;
+  try {
+    registered = await registerDevice(value.device_id, req.auth.organizationId);
+  } catch (error) {
+    if (error.code === "DEVICE_TAKEN") {
+      return fail(res, 409, `Device ID ${value.device_id} is already registered to another hospital.`);
+    }
+    return handleDbError(res, error, value);
+  }
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -273,6 +285,7 @@ const createDevice = async (req, res) => {
     });
   } catch (error) {
     await client.query("ROLLBACK");
+    if (registered) await unregisterDevice(value.device_id, req.auth.organizationId).catch(() => {});
     handleDbError(res, error, value);
   } finally {
     client.release();
@@ -321,6 +334,7 @@ const deleteDevice = async (req, res) => {
   try {
     const result = await pool.query("DELETE FROM devices WHERE device_id = $1", [req.params.id]);
     if (result.rowCount === 0) return fail(res, 404, "Device not found");
+    await unregisterDevice(req.params.id, req.auth.organizationId);
     res.json({ success: true, message: "Device deleted successfully" });
   } catch (error) {
     handleDbError(res, error);

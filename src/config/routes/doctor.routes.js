@@ -1,5 +1,6 @@
 const express = require("express");
 const router = express.Router();
+const { requireAuth } = require("../auth/session");
 
 const {
   listDepartments,
@@ -10,12 +11,13 @@ const {
   deleteDoctor,
 } = require("../controller/doctor.controller");
 
-router.get("/departments", listDepartments);
+router.get("/departments", requireAuth, listDepartments);
 
-router.get("/doctors", listDoctors);
-router.get("/doctors/:id", getDoctor);
-router.post("/doctors", createDoctor);
-router.put("/doctors/:id", updateDoctor);
-router.delete("/doctors/:id", deleteDoctor);
+router.get("/doctors", requireAuth, listDoctors);
+router.get("/doctors/:id", requireAuth, getDoctor);
+router.post("/doctors", requireAuth, createDoctor);
+router.put("/doctors/:id", requireAuth, updateDoctor);
+router.delete("/doctors/:id", requireAuth, deleteDoctor);
 
+// Every route needs a session: it selects the hospital database (see requireAuth).
 module.exports = router;

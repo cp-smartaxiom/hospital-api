@@ -1,9 +1,12 @@
-const pool = require("../database");
+const pool = require("../tenant-pool"); // the logged-in hospital's own database
+const { reassignPatients } = require("../doctor-sync");
 
 /*
  * Doctors + departments API.
- * Doctor JSON: { id, name, departmentId, departmentName, phone, email, status, patientCount }
+ * Doctor JSON: { id, name, departmentId, departmentName, phone, email, status, patientCount, hasAccount, userId }
  * Input:       { id, name, departmentId, phone?, email?, status? }
+ * Doctors with a login account (hasAccount, invited in User Management) are kept in sync from there,
+ * so they can't be edited or deleted through this API.
  * Responses follow { success, message?, data }.
  */
 
@@ -13,7 +16,7 @@ const PHONE = /^\+?[\d\s()-]{7,20}$/;
 const STATUSES = ["active", "inactive"];
 
 const SELECT_DOCTORS = `
-  SELECT d.id, d.name, d.department_id, dep.name AS department_name, d.phone, d.email, d.status,
+  SELECT d.id, d.name, d.department_id, dep.name AS department_name, d.phone, d.email, d.status, d.user_id,
          (SELECT COUNT(*)::int FROM patients p WHERE p.doctor_id = d.id) AS patient_count
   FROM doctors d
   JOIN departments dep ON dep.id = d.department_id
@@ -28,7 +31,15 @@ const toDoctor = (row) => ({
   email: row.email,
   status: row.status,
   patientCount: row.patient_count,
+  hasAccount: row.user_id !== null,
+  /** Login account id (manage it via /users/:id), or null. */
+  userId: row.user_id,
 });
+
+const MANAGED_BY_ACCOUNT = "This doctor has a login account — only the Superadmin can change it (Settings → Doctors).";
+
+const hasAccount = async (id) =>
+  (await pool.query("SELECT 1 FROM doctors WHERE id = $1 AND user_id IS NOT NULL", [id])).rows.length > 0;
 
 const fail = (res, status, message) => res.status(status).json({ success: false, message });
 
@@ -150,6 +161,7 @@ const updateDoctor = async (req, res) => {
   if (errors.length) return fail(res, 400, errors.join("; "));
 
   try {
+    if (await hasAccount(req.params.id)) return fail(res, 409, MANAGED_BY_ACCOUNT);
     const result = await pool.query(
       `UPDATE doctors SET name = $2, department_id = $3, phone = $4, email = $5, status = $6, updated_at = NOW()
        WHERE id = $1`,
@@ -162,9 +174,12 @@ const updateDoctor = async (req, res) => {
   }
 };
 
-// DELETE /api/doctors/:id   → refused while patients are assigned
+// DELETE /api/doctors/:id?reassignTo=D-###   → refused while patients are assigned, unless
+// reassignTo names another active doctor; then the patients move there in the same transaction.
 const deleteDoctor = async (req, res) => {
+  if (req.query.reassignTo) return deleteWithReassign(req, res, String(req.query.reassignTo));
   try {
+    if (await hasAccount(req.params.id)) return fail(res, 409, MANAGED_BY_ACCOUNT);
     const patients = await pool.query("SELECT COUNT(*)::int AS n FROM patients WHERE doctor_id = $1", [req.params.id]);
     if (patients.rows[0].n > 0) {
       return fail(
@@ -180,6 +195,35 @@ const deleteDoctor = async (req, res) => {
     // A patient assigned between the count and the delete still hits the FK.
     if (error.code === "23503") return fail(res, 409, "This doctor has patients. Reassign them first.");
     handleDbError(res, error);
+  }
+};
+
+const deleteWithReassign = async (req, res, reassignTo) => {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const doctor = (await client.query("SELECT user_id FROM doctors WHERE id = $1", [req.params.id])).rows[0];
+    if (!doctor) {
+      await client.query("ROLLBACK");
+      return fail(res, 404, "Doctor not found");
+    }
+    if (doctor.user_id) {
+      await client.query("ROLLBACK");
+      return fail(res, 409, MANAGED_BY_ACCOUNT);
+    }
+    const problem = await reassignPatients(client, req.params.id, reassignTo);
+    if (problem) {
+      await client.query("ROLLBACK");
+      return fail(res, problem.status, problem.message);
+    }
+    await client.query("DELETE FROM doctors WHERE id = $1", [req.params.id]);
+    await client.query("COMMIT");
+    res.json({ success: true, message: "Doctor deleted successfully" });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    handleDbError(res, error);
+  } finally {
+    client.release();
   }
 };
 
